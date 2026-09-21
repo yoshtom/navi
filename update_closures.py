@@ -1,12 +1,17 @@
 import json, re, math, time
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
 JST = timezone(timedelta(hours=9))
-UA = 'BosoRoadNavi/0.2 (+noncommercial internal road-safety dashboard)'
-HEADERS = {'User-Agent': UA}
+UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 BosoRoadNavi/0.3'
+HEADERS = {
+    'User-Agent': UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ja,en-US;q=0.8,en;q=0.6',
+}
 
 # Official starting points. We only follow same-domain links and inspect pages that mention closure-related terms.
 SEEDS = [
@@ -158,8 +163,11 @@ def main():
         'closures':items,
         'note':'公式公開ページを自動巡回。座標を確定できた規制のみルート回避に使用します。'
     }
-    with open('/mnt/data/boso_auto_navi/docs/closures.json','w',encoding='utf-8') as f:
-        json.dump(data,f,ensure_ascii=False,indent=2)
+    out_path = Path(__file__).resolve().parent / 'docs' / 'closures.json'
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open('w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print('saved:', out_path)
     print(json.dumps(data,ensure_ascii=False,indent=2))
 
 if __name__=='__main__':
