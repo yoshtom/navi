@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>房総 通行止め自動回避ナビ</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+:root{--bg:#f4f2ec;--panel:#fff;--ink:#222;--muted:#6b6b6b;--line:#ddd8cf;--accent:#1769aa;--danger:#c62828;--ok:#2e7d32;--warn:#9a5b00}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans JP",sans-serif;background:var(--bg);color:var(--ink)}
+.app{display:grid;grid-template-columns:390px 1fr;height:100vh}.side{background:#fff;border-right:1px solid var(--line);padding:18px;overflow:auto}.map{height:100vh}
+h1{font-size:21px;margin:0 0 5px}.sub,.note{font-size:12px;color:var(--muted);line-height:1.55}.sub{margin-bottom:14px}.section{border-top:1px solid var(--line);margin-top:14px;padding-top:14px}
+label{display:block;font-size:12px;font-weight:700;margin:11px 0 5px}input,button{font:inherit}input{width:100%;padding:10px;border:1px solid #cfcac1;border-radius:8px}button{border:0;border-radius:8px;padding:10px 12px;font-weight:700;cursor:pointer}.primary{background:var(--accent);color:#fff;width:100%;margin-top:11px}.secondary{background:#ece9e2}.tiny{padding:7px 9px;font-size:11px}.row{display:flex;gap:8px;align-items:center}.row>*{flex:1}
+.status{margin-top:10px;padding:10px;border-radius:8px;background:#f4f6f8;font-size:12px;line-height:1.5}.status.ok{background:#eaf6ec}.status.warn{background:#fff4e5}.kpi{display:flex;gap:8px;margin:8px 0}.kpi>div{flex:1;border:1px solid var(--line);padding:8px;border-radius:9px;background:#fafafa}.kpi b{display:block;font-size:18px}.kpi span{font-size:10px;color:var(--muted)}
+.card{border:1px solid var(--line);border-radius:10px;padding:10px;margin:8px 0}.card strong{display:block;font-size:13px}.card small{display:block;color:var(--muted);line-height:1.45}.badge{display:inline-block;padding:3px 6px;border-radius:999px;font-size:10px;font-weight:700;margin-bottom:6px}.red{background:#fde5e5;color:#a51919}.gray{background:#eee;color:#555}.routeInfo{font-size:13px;line-height:1.6;margin-top:10px}
+@media(max-width:800px){.app{grid-template-columns:1fr;grid-template-rows:auto 62vh;height:auto}.side{border-right:0;border-bottom:1px solid var(--line)}.map{height:62vh}}
+</style>
+</head>
+<body><div class="app"><aside class="side">
+<h1>房総 通行止め自動回避ナビ</h1>
+<div class="sub">アクアライン〜房総半島全域。公式公開情報を自動更新し、位置を特定できた通行止めを避けてルートを計算します。</div>
+
+<div id="updateStatus" class="status">規制情報を読み込み中…</div>
+<div class="kpi"><div><b id="closureCount">—</b><span>取得した通行止め</span></div><div><b id="updatedAt">—</b><span>データ更新</span></div></div>
+<button class="secondary" style="width:100%" onclick="loadClosures(true)">↻ 最新データを再読込</button>
+
+<div class="section">
+<label>出発地</label><input id="start" value="木更津駅">
+<label>目的地</label><input id="goal" value="館山駅">
+<button class="primary" onclick="routeNow()">通行止めを避けてルート検索</button>
+<div id="routeStatus" class="status">出発地と目的地を入力してください。</div><div id="routeInfo" class="routeInfo"></div>
+</div>
+
+<div class="section">
+<div class="row"><strong>現在の規制</strong><span></span></div>
+<div id="closureList"></div>
+</div>
+
+<div class="section">
+<label>openrouteservice APIキー（初回のみ）</label>
+<div class="row"><input id="orsKey" type="password" placeholder="無料APIキー"><button class="secondary tiny" onclick="saveKey()">保存</button></div>
+<div class="note">ルート計算にのみ使用し、このブラウザに保存します。規制情報の更新自体にはキー不要です。</div>
+</div>
+
+<div class="section"><div class="note">※ 自動収集した文章だけでは位置を正確に特定できない規制は一覧には表示しますが、安全のため自動回避には使いません。道路管理者の公開情報に位置が明示された区間から順次対応できます。</div></div>
+</aside><div id="map" class="map"></div></div>
+<script>
+const map=L.map('map').setView([35.17,140.02],9);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+let closures=[], closureLayer=L.layerGroup().addTo(map), routeLayer=L.layerGroup().addTo(map);
+const $=id=>document.getElementById(id); $('orsKey').value=localStorage.getItem('boso_ors_key')||'';
+function saveKey(){localStorage.setItem('boso_ors_key',$('orsKey').value.trim()); $('routeStatus').className='status ok';$('routeStatus').textContent='APIキーを保存しました。'}
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+async function loadClosures(force=false){
+ $('updateStatus').className='status';$('updateStatus').textContent='最新の規制情報を読み込み中…';
+ try{const r=await fetch('closures.json'+(force?'?t='+Date.now():''),{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const j=await r.json();closures=j.closures||[];$('closureCount').textContent=closures.length;$('updatedAt').textContent=j.generated_at==='未更新'?'—':new Date(j.generated_at).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'});renderClosures();$('updateStatus').className='status ok';$('updateStatus').textContent='公式情報の自動更新データを表示しています。';}
+ catch(e){$('updateStatus').className='status warn';$('updateStatus').textContent='規制データを取得できませんでした: '+e.message}
+}
+function renderClosures(){closureLayer.clearLayers();const box=$('closureList');box.innerHTML='';if(!closures.length){box.innerHTML='<div class="card"><span class="badge gray">0件</span><strong>現在取得できた通行止めはありません</strong></div>';return}
+ closures.forEach(c=>{const d=document.createElement('div');d.className='card';d.innerHTML='<span class="badge red">通行止め</span><strong>'+esc(c.title)+'</strong><small>'+esc(c.description||'')+(c.precision==='text_only'?'<br>位置未確定のため自動回避対象外':'<br>ルート回避対象')+'</small>';box.appendChild(d);if(c.geometry){const latlngs=c.geometry.map(p=>[p[1],p[0]]);L.polyline(latlngs,{color:'#c62828',weight:8,dashArray:'10 7'}).bindPopup('<b>'+esc(c.title)+'</b><br>'+esc(c.description||'')).addTo(closureLayer)}})
+}
+async function geocode(q){const u='https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=jp&q='+encodeURIComponent(q);const r=await fetch(u,{headers:{'Accept-Language':'ja'}});const j=await r.json();if(!j.length)throw new Error('場所が見つかりません: '+q);return [Number(j[0].lon),Number(j[0].lat)]}
+function lineAvoidPolygon(coords, meters=130){
+ const lats=coords.map(p=>p[1]), lons=coords.map(p=>p[0]);const lat=(Math.min(...lats)+Math.max(...lats))/2;const dLat=meters/111320;const dLon=meters/(111320*Math.cos(lat*Math.PI/180));const minx=Math.min(...lons)-dLon,maxx=Math.max(...lons)+dLon,miny=Math.min(...lats)-dLat,maxy=Math.max(...lats)+dLat;return [[[minx,miny],[maxx,miny],[maxx,maxy],[minx,maxy],[minx,miny]]]
+}
+async function routeNow(){const key=$('orsKey').value.trim();if(!key){$('routeStatus').className='status warn';$('routeStatus').textContent='最初に無料のopenrouteservice APIキーを設定してください。';return}
+ $('routeStatus').className='status';$('routeStatus').textContent='通行止めを避けるルートを計算中…';$('routeInfo').innerHTML='';
+ try{const [a,b]=await Promise.all([geocode($('start').value),geocode($('goal').value)]);const polys=closures.filter(c=>c.geometry).map(c=>lineAvoidPolygon(c.geometry));const body={coordinates:[a,b],instructions:false,language:'ja'};if(polys.length){body.options={avoid_polygons:{type:'MultiPolygon',coordinates:polys}}}
+ const r=await fetch('https://api.heigit.org/openrouteservice/v2/directions/driving-car/geojson',{method:'POST',headers:{'Authorization':key,'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error('ルートAPI '+r.status);const j=await r.json();if(!j.features?.length)throw new Error('走行可能なルートが見つかりません');routeLayer.clearLayers();const gj=L.geoJSON(j,{style:{color:'#1769aa',weight:7}}).addTo(routeLayer);map.fitBounds(gj.getBounds(),{padding:[30,30]});const s=j.features[0].properties.summary;$('routeInfo').innerHTML='<b>'+ (s.distance/1000).toFixed(1)+' km / 約 '+Math.round(s.duration/60)+' 分</b><br>位置を確定できた通行止め '+polys.length+' 件を回避';$('routeStatus').className='status ok';$('routeStatus').textContent='通行止め回避ルートを表示しました。';}
+ catch(e){$('routeStatus').className='status warn';$('routeStatus').textContent=e.message}
+}
+loadClosures();setInterval(()=>loadClosures(true),5*60*1000);
+</script></body></html>
