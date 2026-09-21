@@ -1,4 +1,5 @@
 import json, re, time, hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin, urlparse
@@ -46,7 +47,7 @@ KNOWN_ANCHORS = [
 ]
 
 
-def get(url, timeout=20):
+def get(url, timeout=7):
     r = requests.get(url, headers=HEADERS, timeout=timeout)
     r.raise_for_status()
     if not r.encoding or r.encoding.lower() == 'iso-8859-1':
@@ -221,36 +222,89 @@ def parse_ktr_page(html,url,items):
 
 
 def collect():
-    items=[]; seen_urls=set(); queue=[]
-    # まずシードを取得し、同一ドメインの通行止めリンクを追加
-    for source_name,url in SEEDS:
+    """公式ページを必要最小限だけ巡回する高速版。
+    1サイトの候補数と全体件数を制限し、並列取得することでActionsの長時間停止を防ぐ。
+    """
+    items=[]
+    candidates=[]
+
+    # まず各シード1ページだけ取得。ここは並列。
+    def fetch_seed(pair):
+        source_name,url=pair
         try:
-            r=get(url); queue.append((source_name,url,r.text))
-            links=same_domain_links(r.text,url,['通行止','通行規制','道路','災害','重要なお知らせ','緊急'],cap=45)
-            for href in links: queue.append((source_name,href,None))
-        except Exception as e: print('seed error',source_name,url,e)
-    # 現在情報の高シグナルURL
-    queue.extend([
+            r=get(url)
+            return source_name,url,r.text,None
+        except Exception as e:
+            return source_name,url,None,e
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs=[ex.submit(fetch_seed,x) for x in SEEDS]
+        seed_results=[f.result() for f in as_completed(futs)]
+
+    for source_name,url,html,err in seed_results:
+        if err:
+            print('seed error',source_name,url,err)
+            continue
+        candidates.append((source_name,url,html))
+        # 各サイトから「通行止め/災害」関連だけ最大10件。道路一般リンクは追わない。
+        links=same_domain_links(
+            html,url,
+            ['通行止','通行規制','全面通行止','道路閉鎖','災害','緊急'],
+            cap=10
+        )
+        for href in links:
+            candidates.append((source_name,href,None))
+
+    # 高シグナルURLは必ず追加。
+    candidates.extend([
         ('NEXCO東日本','https://www.e-nexco.co.jp/news/important_info/result.php',None),
         ('富津市','https://www.city.futtsu.lg.jp/emergencyinfo/0000000500.html',None),
     ])
 
-    # NEXCO一覧から最新記事をさらに拾う
-    expanded=[]
-    for source_name,url,html in queue:
-        if url in seen_urls: continue
-        seen_urls.add(url)
-        try:
-            if html is None: html=get(url).text
-        except Exception as e:
-            print('page error',source_name,url,e); continue
-        expanded.append((source_name,url,html))
-        if 'e-nexco.co.jp' in urlparse(url).netloc and ('/news/' in url or 'result.php' in url):
-            for href in same_domain_links(html,url,['通行止め','台風','大雨'],cap=20):
-                if href not in seen_urls: queue.append(('NEXCO東日本',href,None))
-        time.sleep(0.15)
+    # 重複を落として全体上限80ページ。
+    uniq=[]; seen=set()
+    for row in candidates:
+        if row[1] in seen: continue
+        seen.add(row[1]); uniq.append(row)
+        if len(uniq)>=80: break
 
-    for source_name,url,html in expanded:
+    # 未取得ページを並列取得。
+    def fetch_page(row):
+        source_name,url,html=row
+        if html is not None: return source_name,url,html,None
+        try:
+            return source_name,url,get(url).text,None
+        except Exception as e:
+            return source_name,url,None,e
+
+    pages=[]
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs=[ex.submit(fetch_page,row) for row in uniq]
+        for f in as_completed(futs):
+            source_name,url,html,err=f.result()
+            if err:
+                print('page error',source_name,url,err)
+                continue
+            pages.append((source_name,url,html))
+
+    # NEXCOは一覧ページから最新の「通行止め/大雨/台風」記事だけ最大8件追加。
+    nexco_extra=[]
+    for source_name,url,html in pages:
+        if 'e-nexco.co.jp' in urlparse(url).netloc and ('/news/' in url or 'result.php' in url):
+            for href in same_domain_links(html,url,['通行止め','台風','大雨','通行規制'],cap=8):
+                if href not in seen:
+                    seen.add(href); nexco_extra.append(('NEXCO東日本',href,None))
+    if nexco_extra:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futs=[ex.submit(fetch_page,row) for row in nexco_extra[:8]]
+            for f in as_completed(futs):
+                source_name,url,html,err=f.result()
+                if err:
+                    print('nexco extra error',url,err)
+                    continue
+                pages.append((source_name,url,html))
+
+    for source_name,url,html in pages:
         host=urlparse(url).netloc
         try:
             if 'e-nexco.co.jp' in host:
