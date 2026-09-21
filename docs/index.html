@@ -37,37 +37,75 @@ label{display:block;font-size:12px;font-weight:700;margin:11px 0 5px}input,butto
 </div>
 
 <div class="section">
-<label>openrouteservice APIキー（初回のみ）</label>
-<div class="row"><input id="orsKey" type="password" placeholder="無料APIキー"><button class="secondary tiny" onclick="saveKey()">保存</button></div>
-<div class="note">ルート計算にのみ使用し、このブラウザに保存します。規制情報の更新自体にはキー不要です。</div>
+<div class="note">ルート計算はキー不要のValhalla公開サーバーを利用します。大量アクセス向けではないため、検索ボタンを押した時だけ計算します。場所検索結果はこのPCにキャッシュします。</div>
 </div>
 
 <div class="section"><div class="note">※ 自動収集した文章だけでは位置を正確に特定できない規制は一覧には表示しますが、安全のため自動回避には使いません。道路管理者の公開情報に位置が明示された区間から順次対応できます。</div></div>
 </aside><div id="map" class="map"></div></div>
 <script>
-const map=L.map('map').setView([35.17,140.02],9);
+const BOUNDS=[[34.86,139.72],[35.69,140.55]];
+const map=L.map('map');
+map.fitBounds(BOUNDS,{padding:[12,12]});
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
 let closures=[], closureLayer=L.layerGroup().addTo(map), routeLayer=L.layerGroup().addTo(map);
-const $=id=>document.getElementById(id); $('orsKey').value=localStorage.getItem('boso_ors_key')||'';
-function saveKey(){localStorage.setItem('boso_ors_key',$('orsKey').value.trim()); $('routeStatus').className='status ok';$('routeStatus').textContent='APIキーを保存しました。'}
+const $=id=>document.getElementById(id);
+const CLIENT_ID='yoshtom-boso-navi';
+const VALHALLA='https://valhalla1.openstreetmap.de/route';
+const NOMINATIM='https://nominatim.openstreetmap.org/search';
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
 async function loadClosures(force=false){
  $('updateStatus').className='status';$('updateStatus').textContent='最新の規制情報を読み込み中…';
  try{const r=await fetch('closures.json'+(force?'?t='+Date.now():''),{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const j=await r.json();closures=j.closures||[];$('closureCount').textContent=closures.length;$('updatedAt').textContent=j.generated_at==='未更新'?'—':new Date(j.generated_at).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'});renderClosures();$('updateStatus').className='status ok';$('updateStatus').textContent='公式情報の自動更新データを表示しています。';}
  catch(e){$('updateStatus').className='status warn';$('updateStatus').textContent='規制データを取得できませんでした: '+e.message}
 }
-function renderClosures(){closureLayer.clearLayers();const box=$('closureList');box.innerHTML='';if(!closures.length){box.innerHTML='<div class="card"><span class="badge gray">0件</span><strong>現在取得できた通行止めはありません</strong></div>';return}
+function renderClosures(){
+ closureLayer.clearLayers();const box=$('closureList');box.innerHTML='';
+ if(!closures.length){box.innerHTML='<div class="card"><span class="badge gray">0件</span><strong>現在取得できた通行止めはありません</strong></div>';return}
  closures.forEach(c=>{const d=document.createElement('div');d.className='card';d.innerHTML='<span class="badge red">通行止め</span><strong>'+esc(c.title)+'</strong><small>'+esc(c.description||'')+(c.precision==='text_only'?'<br>位置未確定のため自動回避対象外':'<br>ルート回避対象')+'</small>';box.appendChild(d);if(c.geometry){const latlngs=c.geometry.map(p=>[p[1],p[0]]);L.polyline(latlngs,{color:'#c62828',weight:8,dashArray:'10 7'}).bindPopup('<b>'+esc(c.title)+'</b><br>'+esc(c.description||'')).addTo(closureLayer)}})
 }
-async function geocode(q){const u='https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=jp&q='+encodeURIComponent(q);const r=await fetch(u,{headers:{'Accept-Language':'ja'}});const j=await r.json();if(!j.length)throw new Error('場所が見つかりません: '+q);return [Number(j[0].lon),Number(j[0].lat)]}
-function lineAvoidPolygon(coords, meters=130){
- const lats=coords.map(p=>p[1]), lons=coords.map(p=>p[0]);const lat=(Math.min(...lats)+Math.max(...lats))/2;const dLat=meters/111320;const dLon=meters/(111320*Math.cos(lat*Math.PI/180));const minx=Math.min(...lons)-dLon,maxx=Math.max(...lons)+dLon,miny=Math.min(...lats)-dLat,maxy=Math.max(...lats)+dLat;return [[[minx,miny],[maxx,miny],[maxx,maxy],[minx,maxy],[minx,miny]]]
+function cacheKey(q){return 'boso_geo_'+q.trim().toLowerCase()}
+async function geocode(q){
+ q=q.trim(); if(!q) throw new Error('出発地・目的地を入力してください。');
+ const ck=cacheKey(q); const cached=localStorage.getItem(ck); if(cached){try{return JSON.parse(cached)}catch(e){}}
+ const params=new URLSearchParams({format:'jsonv2',limit:'1',countrycodes:'jp',q:q});
+ const r=await fetch(NOMINATIM+'?'+params.toString(),{headers:{'Accept-Language':'ja'}});
+ if(!r.ok)throw new Error('場所検索に失敗しました: '+r.status);
+ const j=await r.json(); if(!j.length)throw new Error('場所が見つかりません: '+q);
+ const out=[Number(j[0].lon),Number(j[0].lat)]; localStorage.setItem(ck,JSON.stringify(out)); return out;
 }
-async function routeNow(){const key=$('orsKey').value.trim();if(!key){$('routeStatus').className='status warn';$('routeStatus').textContent='最初に無料のopenrouteservice APIキーを設定してください。';return}
+function haversine(a,b){
+ const R=6371000, rad=Math.PI/180, dLat=(b[1]-a[1])*rad, dLon=(b[0]-a[0])*rad;
+ const la1=a[1]*rad, la2=b[1]*rad; const h=Math.sin(dLat/2)**2+Math.cos(la1)*Math.cos(la2)*Math.sin(dLon/2)**2;
+ return 2*R*Math.asin(Math.sqrt(h));
+}
+function densify(coords, step=220){
+ const out=[]; for(let i=0;i<coords.length-1;i++){const a=coords[i],b=coords[i+1],d=haversine(a,b),n=Math.max(1,Math.ceil(d/step));for(let k=0;k<n;k++){const t=k/n;out.push([a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t])}} if(coords.length)out.push(coords[coords.length-1]); return out;
+}
+function avoidLocations(){
+ const pts=[]; closures.filter(c=>Array.isArray(c.geometry)&&c.geometry.length).forEach(c=>densify(c.geometry).forEach(p=>pts.push({lat:p[1],lon:p[0]})));
+ return pts.slice(0,80);
+}
+function decodePolyline6(str){
+ let idx=0,lat=0,lon=0,coords=[]; while(idx<str.length){let b,shift=0,result=0;do{b=str.charCodeAt(idx++)-63;result|=(b&0x1f)<<shift;shift+=5}while(b>=0x20);lat+=((result&1)?~(result>>1):(result>>1));shift=0;result=0;do{b=str.charCodeAt(idx++)-63;result|=(b&0x1f)<<shift;shift+=5}while(b>=0x20);lon+=((result&1)?~(result>>1):(result>>1));coords.push([lat/1e6,lon/1e6])} return coords;
+}
+async function routeNow(){
  $('routeStatus').className='status';$('routeStatus').textContent='通行止めを避けるルートを計算中…';$('routeInfo').innerHTML='';
- try{const [a,b]=await Promise.all([geocode($('start').value),geocode($('goal').value)]);const polys=closures.filter(c=>c.geometry).map(c=>lineAvoidPolygon(c.geometry));const body={coordinates:[a,b],instructions:false,language:'ja'};if(polys.length){body.options={avoid_polygons:{type:'MultiPolygon',coordinates:polys}}}
- const r=await fetch('https://api.heigit.org/openrouteservice/v2/directions/driving-car/geojson',{method:'POST',headers:{'Authorization':key,'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error('ルートAPI '+r.status);const j=await r.json();if(!j.features?.length)throw new Error('走行可能なルートが見つかりません');routeLayer.clearLayers();const gj=L.geoJSON(j,{style:{color:'#1769aa',weight:7}}).addTo(routeLayer);map.fitBounds(gj.getBounds(),{padding:[30,30]});const s=j.features[0].properties.summary;$('routeInfo').innerHTML='<b>'+ (s.distance/1000).toFixed(1)+' km / 約 '+Math.round(s.duration/60)+' 分</b><br>位置を確定できた通行止め '+polys.length+' 件を回避';$('routeStatus').className='status ok';$('routeStatus').textContent='通行止め回避ルートを表示しました。';}
- catch(e){$('routeStatus').className='status warn';$('routeStatus').textContent=e.message}
+ try{
+   const a=await geocode($('start').value); await sleep(1100); const b=await geocode($('goal').value);
+   const avoid=avoidLocations();
+   const body={locations:[{lat:a[1],lon:a[0]},{lat:b[1],lon:b[0]}],costing:'auto',avoid_locations:avoid,directions_options:{units:'kilometers',language:'ja-JP'},date_time:{type:0}};
+   const r=await fetch(VALHALLA,{method:'POST',headers:{'Content-Type':'application/json','X-Client-Id':CLIENT_ID},body:JSON.stringify(body)});
+   if(r.status===429)throw new Error('ルート検索が混み合っています。少ししてから再検索してください。');
+   if(!r.ok){let msg='';try{const e=await r.json();msg=e.error||e.status||''}catch(e){}throw new Error('ルート計算に失敗しました '+r.status+(msg?'：'+msg:''));}
+   const j=await r.json(); if(!j.trip?.legs?.length)throw new Error('走行可能なルートが見つかりません');
+   routeLayer.clearLayers(); let all=[]; j.trip.legs.forEach(leg=>{if(leg.shape)all=all.concat(decodePolyline6(leg.shape))});
+   if(!all.length)throw new Error('ルート形状を取得できませんでした');
+   const line=L.polyline(all,{color:'#1769aa',weight:7,opacity:.9}).addTo(routeLayer); map.fitBounds(line.getBounds(),{padding:[30,30]});
+   const s=j.trip.summary||{}; const km=Number(s.length||0); const mins=Math.round(Number(s.time||0)/60);
+   $('routeInfo').innerHTML='<b>'+km.toFixed(1)+' km / 約 '+mins+' 分</b><br>位置を確定できた通行止め '+avoid.length+' 地点を回避対象に設定';
+   $('routeStatus').className='status ok';$('routeStatus').textContent='通行止め回避ルートを表示しました。';
+ }catch(e){$('routeStatus').className='status warn';$('routeStatus').textContent=e.message}
 }
-loadClosures();setInterval(()=>loadClosures(true),5*60*1000);
+loadClosures(); setInterval(()=>loadClosures(true),5*60*1000);
 </script></body></html>
